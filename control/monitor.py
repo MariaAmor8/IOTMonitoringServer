@@ -10,6 +10,8 @@ from django.conf import settings
 
 client = mqtt.Client(settings.MQTT_USER_PUB)
 
+# Guarda el último estado enviado por estación (para no publicar repetido)
+LAST_LED_STATE = {}  # key: (country, state, city, user) -> "LED_ON"/"LED_OFF"
 
 def analyze_data():
     # Consulta todos los datos de la última hora, los agrupa por estación y variable
@@ -57,6 +59,70 @@ def analyze_data():
 
     print(len(aggregation), "dispositivos revisados")
     print(alerts, "alertas enviadas")
+    
+    
+def analyze_led_temp_5min():
+    """
+    Evento: promedio de temperatura últimos 5 minutos > max_value (en Measurement)
+    Acción: publicar LED_ON / LED_OFF al tópico .../<user>/in
+    """
+    print("Calculando evento LED por temperatura promedio (5 min)...")
+
+    # Trae datos de los últimos 5 minutos solo para temperatura
+    data_qs = Data.objects.filter(
+        base_time__gte=datetime.now() - timedelta(minutes=5),
+        measurement__name__iexact="temperatura"
+    )
+
+    # Agrupa por estación/usuario y ubicación, calcula promedio
+    aggregation = (
+        data_qs
+        .select_related('station', 'measurement')
+        .select_related('station__user', 'station__location')
+        .select_related('station__location__city', 'station__location__state', 'station__location__country')
+        .values(
+            'station__user__username',
+            'station__location__city__name',
+            'station__location__state__name',
+            'station__location__country__name',
+            'measurement__max_value',
+        )
+        .annotate(avg_temp=Avg('avg_value'))
+    )
+
+    processed = 0
+    changes = 0
+
+    for item in aggregation:
+        processed += 1
+
+        user = item['station__user__username']
+        city = item['station__location__city__name']
+        state = item['station__location__state__name']
+        country = item['station__location__country__name']
+
+        avg_temp = item['avg_temp'] or 0.0
+        threshold = item['measurement__max_value'] or 0.0
+
+        # Si no hay umbral configurado, por seguridad no prendemos el LED
+        if threshold <= 0:
+            desired = "LED_OFF"
+        else:
+            desired = "LED_ON" if avg_temp > threshold else "LED_OFF"
+
+        topic = f"{country}/{state}/{city}/{user}/in"
+
+        key = (country, state, city, user)
+        last = LAST_LED_STATE.get(key)
+
+        # Solo publica si cambió el estado
+        if last != desired:
+            print(datetime.now(), f"avg_temp={avg_temp:.2f} threshold={threshold:.2f} -> {desired} to {topic}")
+            client.publish(topic, desired)
+            LAST_LED_STATE[key] = desired
+            changes += 1
+
+    print(f"{processed} estaciones revisadas. {changes} cambios LED publicados.")
 
 
 def on_connect(client, userdata, flags, rc):
@@ -95,6 +161,7 @@ def setup_mqtt():
         client.username_pw_set(settings.MQTT_USER_PUB,
                                settings.MQTT_PASSWORD_PUB)
         client.connect(settings.MQTT_HOST, settings.MQTT_PORT)
+        client.loop_start()
 
     except Exception as e:
         print('Ocurrió un error al conectar con el bróker MQTT:', e)
@@ -106,6 +173,7 @@ def start_cron():
     '''
     print("Iniciando cron...")
     schedule.every(5).minutes.do(analyze_data)
+    schedule.every(1).minutes.do(analyze_led_temp_5min)
     print("Servicio de control iniciado")
     while 1:
         schedule.run_pending()
