@@ -7,6 +7,7 @@ import paho.mqtt.client as mqtt
 import schedule
 import time
 from django.conf import settings
+from django.utils import timezone
 
 client = mqtt.Client(settings.MQTT_USER_PUB)
 
@@ -67,10 +68,12 @@ def analyze_led_temp_5min():
     Acción: publicar LED_ON / LED_OFF al tópico .../<user>/in
     """
     print("Calculando evento LED por temperatura promedio (5 min)...")
+    
+    cutoff = timezone.now() - timedelta(minutes=5)
 
     # Trae datos de los últimos 5 minutos solo para temperatura
     data_qs = Data.objects.filter(
-        base_time__gte=datetime.now() - timedelta(minutes=5),
+        time__gte=cutoff,
         measurement__name__iexact="temperatura"
     )
 
