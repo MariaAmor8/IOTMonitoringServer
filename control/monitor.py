@@ -8,6 +8,7 @@ import schedule
 import time
 from django.conf import settings
 from django.utils import timezone
+import time as pytime
 
 client = mqtt.Client(settings.MQTT_USER_PUB)
 
@@ -68,64 +69,67 @@ def analyze_led_temp_5min():
     Acción: publicar LED_ON / LED_OFF al tópico .../<user>/in
     """
     print("Calculando evento LED por temperatura promedio (5 min)...")
-    
-    cutoff = timezone.now() - timedelta(minutes=5)
+    try:
+        cutoff_epoch = int(pytime.time() * 1_000_000) - 5*60*1_000_000
 
-    # Trae datos de los últimos 5 minutos solo para temperatura
-    data_qs = Data.objects.filter(
-        time__gte=cutoff,
-        measurement__name__iexact="temperatura"
-    )
-
-    # Agrupa por estación/usuario y ubicación, calcula promedio
-    aggregation = (
-        data_qs
-        .select_related('station', 'measurement')
-        .select_related('station__user', 'station__location')
-        .select_related('station__location__city', 'station__location__state', 'station__location__country')
-        .values(
-            'station__user__username',
-            'station__location__city__name',
-            'station__location__state__name',
-            'station__location__country__name',
-            'measurement__max_value',
+        # Trae datos de los últimos 5 minutos solo para temperatura
+        data_qs = Data.objects.filter(
+            time__gte=cutoff_epoch,
+            measurement__name__iexact="temperatura"
         )
-        .annotate(avg_temp=Avg('avg_value'))
-    )
 
-    processed = 0
-    changes = 0
+        # Agrupa por estación/usuario y ubicación, calcula promedio
+        aggregation = (
+            data_qs
+            .select_related('station', 'measurement')
+            .select_related('station__user', 'station__location')
+            .select_related('station__location__city', 'station__location__state', 'station__location__country')
+            .values(
+                'station__user__username',
+                'station__location__city__name',
+                'station__location__state__name',
+                'station__location__country__name',
+                'measurement__max_value',
+            )
+            .annotate(avg_temp=Avg('avg_value'))
+        )
 
-    for item in aggregation:
-        processed += 1
+        processed = 0
+        changes = 0
 
-        user = item['station__user__username']
-        city = item['station__location__city__name']
-        state = item['station__location__state__name']
-        country = item['station__location__country__name']
+        for item in aggregation:
+            processed += 1
 
-        avg_temp = item['avg_temp'] or 0.0
-        threshold = item['measurement__max_value'] or 0.0
+            user = item['station__user__username']
+            city = item['station__location__city__name']
+            state = item['station__location__state__name']
+            country = item['station__location__country__name']
 
-        # Si no hay umbral configurado, por seguridad no prendemos el LED
-        if threshold <= 0:
-            desired = "LED_OFF"
-        else:
-            desired = "LED_ON" if avg_temp > threshold else "LED_OFF"
+            avg_temp = item['avg_temp'] or 0.0
+            threshold = item['measurement__max_value'] or 0.0
 
-        topic = f"{country}/{state}/{city}/{user}/in"
+            # Si no hay umbral configurado, por seguridad no prendemos el LED
+            if threshold <= 0:
+                desired = "LED_OFF"
+            else:
+                desired = "LED_ON" if avg_temp > threshold else "LED_OFF"
 
-        key = (country, state, city, user)
-        last = LAST_LED_STATE.get(key)
+            topic = f"{country}/{state}/{city}/{user}/in"
 
-        # Solo publica si cambió el estado
-        if last != desired:
-            print(datetime.now(), f"avg_temp={avg_temp:.2f} threshold={threshold:.2f} -> {desired} to {topic}")
-            client.publish(topic, desired)
-            LAST_LED_STATE[key] = desired
-            changes += 1
+            key = (country, state, city, user)
+            last = LAST_LED_STATE.get(key)
 
-    print(f"{processed} estaciones revisadas. {changes} cambios LED publicados.")
+            # Solo publica si cambió el estado
+            if last != desired:
+                print(datetime.now(), f"avg_temp={avg_temp:.2f} threshold={threshold:.2f} -> {desired} to {topic}")
+                client.publish(topic, desired)
+                LAST_LED_STATE[key] = desired
+                changes += 1
+
+        print(f"{processed} estaciones revisadas. {changes} cambios LED publicados.")
+        
+    except Exception as e:
+        print("Error en analyze_led_temp_5min:", e)
 
 
 def on_connect(client, userdata, flags, rc):
