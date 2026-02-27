@@ -70,7 +70,25 @@ def analyze_led_temp_5min():
     """
     print("Calculando evento LED por temperatura promedio (5 min)...")
     try:
-        cutoff_epoch = int(pytime.time() * 1_000_000) - 5*60*1_000_000
+        latest = Data.objects.order_by('-id').values_list('time', flat=True).first()
+        digits = len(str(latest)) if latest else 13  # fallback
+        
+        now = pytime.time()
+        
+        if digits <= 10:
+            # segundos
+            cutoff_epoch = int(now) - 5*60
+        elif digits <= 13:
+            # milisegundos
+            cutoff_epoch = int(now * 1_000) - 5*60*1_000
+        elif digits <= 16:
+            # microsegundos
+            cutoff_epoch = int(now * 1_000_000) - 5*60*1_000_000
+        else:
+            # nanosegundos (o similar)
+            cutoff_epoch = int(now * 1_000_000_000) - 5*60*1_000_000_000
+        
+        print("DEBUG time digits =", digits, "latest =", latest, "cutoff =", cutoff_epoch)
 
         # Trae datos de los últimos 5 minutos solo para temperatura
         data_qs = Data.objects.filter(
