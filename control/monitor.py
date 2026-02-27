@@ -61,7 +61,7 @@ def analyze_data():
 
     print(len(aggregation), "dispositivos revisados")
     print(alerts, "alertas enviadas")
-    analyze_led_temp_5min()
+    analyze_led_from_db()
     
 def analyze_led_temp_5min():
     """
@@ -72,9 +72,9 @@ def analyze_led_temp_5min():
     try:
         latest = Data.objects.order_by('-id').values_list('time', flat=True).first()
         digits = len(str(latest)) if latest else 13  # fallback
-        
+
         now = pytime.time()
-        
+
         if digits <= 10:
             # segundos
             cutoff_epoch = int(now) - 5*60
@@ -87,7 +87,7 @@ def analyze_led_temp_5min():
         else:
             # nanosegundos (o similar)
             cutoff_epoch = int(now * 1_000_000_000) - 5*60*1_000_000_000
-        
+
         print("DEBUG time digits =", digits, "latest =", latest, "cutoff =", cutoff_epoch)
 
         # Trae datos de los últimos 5 minutos solo para temperatura
@@ -148,6 +148,66 @@ def analyze_led_temp_5min():
         
     except Exception as e:
         print("Error en analyze_led_temp_5min:", e)
+        
+        
+def analyze_led_from_db():
+    """
+    Condición (con consulta a BD):
+      - promedio de temperatura (última hora) por estación > measurement.max_value
+    Acción:
+      - publicar LED_ON / LED_OFF a .../<user>/in
+    """
+    print("Calculando evento LED (DB) por promedio de temperatura...")
+
+    cutoff = timezone.now() - timedelta(hours=1)
+
+    qs = (
+        Data.objects.filter(
+            base_time__gte=cutoff,
+            measurement__name__iexact="temperatura"
+        )
+        .select_related('station__user', 'station__location__city',
+                        'station__location__state', 'station__location__country',
+                        'measurement')
+        .values(
+            'station__user__username',
+            'station__location__city__name',
+            'station__location__state__name',
+            'station__location__country__name',
+            'measurement__max_value',
+        )
+        .annotate(avg_temp=Avg('avg_value'))
+    )
+
+    processed = 0
+    changes = 0
+
+    for item in qs:
+        processed += 1
+
+        user = item['station__user__username']
+        city = item['station__location__city__name']
+        state = item['station__location__state__name']
+        country = item['station__location__country__name']
+
+        avg_temp = float(item['avg_temp'] or 0.0)
+        threshold = float(item['measurement__max_value'] or 0.0)
+
+        # si no hay threshold, mantenemos OFF
+        desired = "LED_ON" if (threshold > 0 and avg_temp > threshold) else "LED_OFF"
+
+        topic = f"{country}/{state}/{city}/{user}/in"
+
+        key = (country, state, city, user)
+        last = LAST_LED_STATE.get(key)
+
+        if last != desired:
+            print(datetime.now(), f"LED(DB): avg={avg_temp:.2f} thr={threshold:.2f} -> {desired} to {topic}")
+            client.publish(topic, desired)
+            LAST_LED_STATE[key] = desired
+            changes += 1
+
+    print(f"{processed} estaciones revisadas. {changes} cambios LED publicados.")
 
 
 def on_connect(client, userdata, flags, rc):
